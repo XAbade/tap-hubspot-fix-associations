@@ -579,7 +579,7 @@ class Taphubspot(Tap):
                     continue
 
                 # add toObjectTypeId, fromObjectTypeId and name to properties_list to be mapped in the widget
-                properties_list.append(th.Property(f"{association_name}", th.StringType))
+                properties_list.append(th.Property(f"{association_name}", th.ArrayType(th.StringType)))
 
                 # add metadata for the association field
                 associations_metadata[association_name] = {
