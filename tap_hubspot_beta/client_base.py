@@ -196,7 +196,7 @@ class hubspotStream(RESTStream):
 
         for field, info in fields_to_inject.items():
             if str(info.get("associationTypeId")) in assoc_type_ids:
-                injected[field] = record.get("to_id")
+                injected[field] = [record.get("to_id")]
 
         return {record["from_id"]: injected}
 
