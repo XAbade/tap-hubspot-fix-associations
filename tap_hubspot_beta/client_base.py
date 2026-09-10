@@ -519,7 +519,7 @@ class hubspotStream(RESTStream):
         if associations_to_fetch and self.stream_object_type in associations_to_fetch:
             associations = self.get_crm_associations_metadata()
             for association in associations:
-                properties.append(th.Property(association, th.StringType))
+                properties.append(th.Property(association, th.ArrayType(th.StringType)))
 
         return th.PropertiesList(*properties).to_dict()
 
