@@ -3228,6 +3228,175 @@ class ThreadsStream(hubspotV3Stream):
         return super().get_next_page_token(response, previous_token)
 
 
+    def get_child_context(self, record: dict, context) -> dict:
+        return {"thread_id": record["id"]}
+
+
+class MessagesStream(hubspotV3Stream):
+    """Conversations Messages Stream.
+
+    Retrieves every message for each thread synced by the parent threads
+    stream. See:
+    https://developers.hubspot.com/docs/api/conversations/conversations
+    """
+
+    name = "messages"
+    path = "conversations/v3/conversations/threads/{thread_id}/messages"
+    parent_stream_type = ThreadsStream
+    primary_keys = ["id"]
+    # The endpoint has no server-side time filter, but it can sort by
+    # createdAt. We fetch newest-first and stop paging a thread once we reach
+    # messages at/older than the bookmark (client-side incremental).
+    replication_key = "createdAt"
+    # Keep a single state partition instead of one entry per thread.
+    state_partitioning_keys = []
+    # Newest-first within each thread, so records are not globally sorted.
+    is_sorted = False
+    # Re-read this window before the bookmark to be safe; target dedupes on id.
+    lookback = timedelta(minutes=5)
+
+    _start_ts = None
+    _max_created_at = None
+    _reached_bookmark = False
+
+    schema = th.PropertiesList(
+        th.Property("id", th.StringType),
+        th.Property("conversationsThreadId", th.StringType),
+        th.Property("type", th.StringType),
+        th.Property("createdAt", th.DateTimeType),
+        th.Property("updatedAt", th.DateTimeType),
+        th.Property("createdBy", th.StringType),
+        th.Property(
+            "client",
+            th.ObjectType(
+                th.Property("clientType", th.StringType),
+                th.Property("integrationAppId", th.IntegerType),
+            ),
+        ),
+        th.Property(
+            "senders",
+            th.ArrayType(
+                th.ObjectType(
+                    th.Property("actorId", th.StringType),
+                    th.Property("name", th.StringType),
+                    th.Property("senderField", th.StringType),
+                    th.Property(
+                        "deliveryIdentifier",
+                        th.ObjectType(
+                            th.Property("type", th.StringType),
+                            th.Property("value", th.StringType),
+                        ),
+                    ),
+                )
+            ),
+        ),
+        th.Property(
+            "recipients",
+            th.ArrayType(
+                th.ObjectType(
+                    th.Property("actorId", th.StringType),
+                    th.Property("name", th.StringType),
+                    th.Property("recipientField", th.StringType),
+                    th.Property(
+                        "deliveryIdentifier",
+                        th.ObjectType(
+                            th.Property("type", th.StringType),
+                            th.Property("value", th.StringType),
+                        ),
+                    ),
+                )
+            ),
+        ),
+        th.Property("archived", th.BooleanType),
+        th.Property("text", th.StringType),
+        th.Property("richText", th.StringType),
+        th.Property("subject", th.StringType),
+        th.Property("inReplyToId", th.StringType),
+        th.Property("attachments", th.ArrayType(th.CustomType({"type": "object"}))),
+        th.Property("truncationStatus", th.StringType),
+        th.Property("status", th.CustomType({"type": "object"})),
+        th.Property("direction", th.StringType),
+        th.Property("channelId", th.StringType),
+        th.Property("channelAccountId", th.StringType),
+        # THREAD_STATUS_CHANGE messages
+        th.Property("newStatus", th.StringType),
+        # ASSIGNMENT messages
+        th.Property("assignedTo", th.StringType),
+    ).to_dict()
+
+    def get_start_ts(self) -> Optional[datetime]:
+        """Stream-level bookmark (minus lookback), read once per sync.
+
+        Managed here rather than via SDK partition state, because the tap
+        resets child-stream partition state on every sync.
+        """
+        if self._start_ts is None:
+            state = self.stream_state
+            value = None
+            if state.get("replication_key") == self.replication_key:
+                value = state.get("replication_key_value")
+            value = value or self.config.get("start_date")
+            if value:
+                start = parse(value)
+                if not start.tzinfo:
+                    start = start.replace(tzinfo=pytz.utc)
+                self._start_ts = start - self.lookback
+        return self._start_ts
+
+    def get_url_params(
+        self, context: Optional[dict], next_page_token: Optional[Any]
+    ) -> Dict[str, Any]:
+        params = super().get_url_params(context, next_page_token)
+        params["sort"] = "-createdAt"
+        if next_page_token is None:
+            # first page of a new thread
+            self._reached_bookmark = False
+        return params
+
+    def parse_response(self, response: requests.Response) -> Iterable[dict]:
+        start = self.get_start_ts()
+        for row in super().parse_response(response):
+            if start and row.get("createdAt") and parse(row["createdAt"]) <= start:
+                # sorted newest-first: everything after this is older
+                self._reached_bookmark = True
+                continue
+            yield row
+
+    def get_next_page_token(
+        self, response: requests.Response, previous_token: Optional[Any]
+    ) -> Optional[Any]:
+        """Return a token for identifying next page or None if no more pages."""
+        if not response.json().get("results") or self._reached_bookmark:
+            return None
+        return super().get_next_page_token(response, previous_token)
+
+    def post_process(self, row: dict, context: Optional[dict] = None) -> dict:
+        row = super().post_process(row, context)
+        if row is not None and not row.get("conversationsThreadId") and context:
+            row["conversationsThreadId"] = context.get("thread_id")
+        if row is not None and row.get("createdAt"):
+            created_at = row["createdAt"]
+            if not isinstance(created_at, datetime):
+                created_at = parse(created_at)
+            if not created_at.tzinfo:
+                created_at = created_at.replace(tzinfo=pytz.utc)
+            if self._max_created_at is None or created_at > self._max_created_at:
+                self._max_created_at = created_at
+        return row
+
+    def finalize_state_progress_markers(self, state: Optional[dict] = None) -> None:
+        super().finalize_state_progress_markers(state)
+        # Advance the stream-level bookmark only once the sync has finished
+        if self._max_created_at is not None:
+            stream_state = self.stream_state
+            current = stream_state.get("replication_key_value")
+            if not current or self._max_created_at > parse(current):
+                stream_state["replication_key"] = self.replication_key
+                stream_state["replication_key_value"] = self._max_created_at.isoformat()
+            # Emit a final STATE so the new bookmark is persisted
+            self._write_state_message()
+
+
 class ChannelsStream(hubspotV3Stream):
     """Channels Stream"""
 
