@@ -3132,7 +3132,7 @@ class CampaignAssetsStream(hubspotV3Stream):
     name = "campaign_assets"
     parent_stream_type = CampaignsStream
     path = "marketing/v3/campaigns/{campaign_id}/assets/{asset_type}"
-    primary_keys = ["id"]
+    primary_keys = ["id", "campaign_id"]
     replication_key = None
 
     schema = th.PropertiesList(
